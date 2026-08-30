@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simms"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agent-friendly CLI for simulated mass spectrometry test data: generation, mutation, merging and pipelines built on matchms, MassBank data and (optionally) OpenMS TOPP tools."
 readme = "README.md"
 requires-python = ">=3.9"

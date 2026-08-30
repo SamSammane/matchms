@@ -10,4 +10,4 @@ A command-line orchestrator that combines:
 - OpenMS TOPP tools as an optional native backend when installed.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

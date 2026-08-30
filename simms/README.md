@@ -49,6 +49,31 @@ Noise presets: `none`, `clean-orbitrap`, `default`, `noisy-qtof`, `harsh` —
 each overridable per parameter (`--mz-ppm`, `--intensity-cv`, `--dropout`,
 `--noise-peaks`, `--noise-peak-intensity`).
 
+### Realism model
+
+Peptide MS2 intensities use a **mobile-proton model** by default
+(`--fragment-model realistic`): y-over-b dominance, suppressed b1/prominent
+b2, the proline effect, enhanced D/E cleavage for non-mobile precursors,
+-H2O/-NH3 neutral losses, immonium ions, fragment M+1 isotopes, and
+collision-energy dependence (`--collision-energy`, higher CE shifts
+intensity to low-mass fragments). `--fragment-model simple` restores the
+clean b/y ladder.
+
+`generate lcms-run` layers instrument and chromatography physics,
+controlled by `--realism none|default|high` plus per-knob overrides:
+
+| Feature | Knob |
+|---|---|
+| EMG (tailing) elution, width growth along gradient | `--tailing-tau`, `--rt-broadening` |
+| MS1 isotope envelopes (formula or averagine from mass) | `--no-isotope-envelopes` |
+| Electrospray charge-state envelopes (z−1, z, z+1) | `--no-charge-envelope` |
+| Background contaminant ions (polysiloxanes, phthalates) | `--no-contaminants` |
+| Chemical noise per scan / spray instability (AR(1)) | `--chemical-noise`, `--spray-cv` |
+| Mass calibration drift over the run | `--drift-ppm` |
+| Detector saturation (soft knee, hard clip) | `--saturation` |
+| DDA dynamic exclusion | `--exclusion` |
+| Co-isolation chimeric MS2 spectra | `--isolation-window`, `--no-chimeras` |
+
 ## Combining and converting
 
 ```bash

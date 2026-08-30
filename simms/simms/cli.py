@@ -41,6 +41,64 @@ def _noise_from_args(args: argparse.Namespace) -> NoiseModel:
     )
 
 
+def _add_realism_options(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("instrument & chromatography realism")
+    group.add_argument("--realism", choices=["none", "default", "high"],
+                       default="default", help="realism preset (default: default)")
+    group.add_argument("--tailing-tau", type=float,
+                       help="override: EMG tail constant as multiple of peak sigma")
+    group.add_argument("--rt-broadening", type=float,
+                       help="override: fractional peak-width growth across the gradient")
+    group.add_argument("--drift-ppm", type=float,
+                       help="override: peak-to-peak mass calibration drift over the run")
+    group.add_argument("--chemical-noise", type=int,
+                       help="override: chemical noise peaks per MS1 scan")
+    group.add_argument("--spray-cv", type=float,
+                       help="override: spray instability CV (correlated per-scan flicker)")
+    group.add_argument("--saturation", type=float,
+                       help="override: detector full scale (intensity clip level)")
+    group.add_argument("--isolation-window", type=float,
+                       help="override: MS2 isolation window width in m/z")
+    group.add_argument("--exclusion", type=float,
+                       help="override: dynamic exclusion time in seconds")
+    group.add_argument("--no-charge-envelope", action="store_true",
+                       help="disable electrospray charge-state envelopes")
+    group.add_argument("--no-isotope-envelopes", action="store_true",
+                       help="disable MS1 isotope envelopes (single precursor peak)")
+    group.add_argument("--no-contaminants", action="store_true",
+                       help="disable background contaminant ions")
+    group.add_argument("--no-chimeras", action="store_true",
+                       help="disable co-isolation chimeric MS2 spectra")
+
+
+def _realism_from_args(args: argparse.Namespace):
+    from dataclasses import replace
+    from .realism import REALISM_PRESETS
+    config = REALISM_PRESETS[args.realism]
+    overrides = {}
+    for arg_name, field_name in [
+            ("tailing_tau", "tailing_tau_factor"),
+            ("rt_broadening", "rt_broadening"),
+            ("drift_ppm", "drift_ppm"),
+            ("chemical_noise", "chemical_noise_peaks"),
+            ("spray_cv", "spray_instability_cv"),
+            ("saturation", "saturation"),
+            ("isolation_window", "isolation_window"),
+            ("exclusion", "dynamic_exclusion_seconds")]:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            overrides[field_name] = value
+    if args.no_charge_envelope:
+        overrides["charge_envelope"] = False
+    if args.no_isotope_envelopes:
+        overrides["isotope_envelopes"] = False
+    if args.no_contaminants:
+        overrides["contaminants"] = False
+    if args.no_chimeras:
+        overrides["chimeras"] = False
+    return replace(config, **overrides)
+
+
 def _parse_filters(pairs: Optional[List[str]]) -> Dict[str, str]:
     filters = {}
     for pair in pairs or []:
@@ -88,6 +146,19 @@ def cmd_describe(args: argparse.Namespace) -> int:
         "write_formats": ["mgf", "msp", "json", "pickle",
                           "MassBank record directory", "mzML (lcms-run)"],
         "noise_presets": sorted(NOISE_PRESETS),
+        "realism_presets": ["none", "default", "high"],
+        "realism_features": [
+            "EMG (tailing) elution profiles with gradient peak broadening",
+            "MS1 isotope envelopes from formula or averagine model",
+            "electrospray charge-state envelopes",
+            "background contaminant ions (polysiloxanes, phthalates)",
+            "per-scan chemical noise and AR(1) spray instability",
+            "sinusoidal mass calibration drift",
+            "detector saturation (soft knee + hard clip)",
+            "DDA dynamic exclusion and co-isolation chimeric MS2",
+            "mobile-proton MS2 intensity model with neutral losses, "
+            "immonium ions, fragment isotopes and collision-energy dependence",
+        ],
         "openms_tools_available": sorted(openms_backend.discover()),
     }
     print(json.dumps(manifest, indent=2))
@@ -110,7 +181,9 @@ def cmd_generate_peptides(args: argparse.Namespace) -> int:
     charges = [int(c) for c in args.charges.split(",")]
     spectra = [simulate.theoretical_peptide_spectrum(
                    seq, charge=z, ion_types=args.ion_types,
-                   max_fragment_charge=args.max_fragment_charge)
+                   max_fragment_charge=args.max_fragment_charge,
+                   model=args.fragment_model,
+                   collision_energy=args.collision_energy)
                for seq in sequences for z in charges]
     noise = _noise_from_args(args)
     if args.variants > 0:
@@ -119,6 +192,7 @@ def cmd_generate_peptides(args: argparse.Namespace) -> int:
     written = io_utils.save_any(spectra, args.out)
     _emit(args, {"command": "generate peptides", "peptides": len(sequences),
                  "charges": charges, "variants": args.variants,
+                 "fragment_model": args.fragment_model,
                  "spectra_written": written, "out": args.out, "seed": args.seed})
     return 0
 
@@ -178,8 +252,10 @@ def cmd_generate_lcms_run(args: argparse.Namespace) -> int:
     result = simulate.simulate_lcms_run(
         spectra, args.out, gradient_seconds=args.gradient,
         peak_fwhm_seconds=args.peak_fwhm, ms1_interval_seconds=args.ms1_interval,
-        dda_top_n=args.top_n, noise=noise, seed=args.seed)
+        dda_top_n=args.top_n, noise=noise, realism=_realism_from_args(args),
+        seed=args.seed)
     result["command"] = "generate lcms-run"
+    result["realism"] = args.realism
     _emit(args, result)
     return 0
 
@@ -299,8 +375,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-length", type=int, default=6)
     p.add_argument("--max-length", type=int, default=40)
     p.add_argument("--charges", default="2", help="comma-separated precursor charges")
-    p.add_argument("--ion-types", default="by", help="fragment ion series, e.g. by, aby")
+    p.add_argument("--ion-types", default="by",
+                   help="fragment ion series for the simple model, e.g. by, aby")
     p.add_argument("--max-fragment-charge", type=int, default=1)
+    p.add_argument("--fragment-model", choices=["simple", "realistic"],
+                   default="realistic",
+                   help="intensity model: simple b/y ladder, or mobile-proton "
+                        "realistic model with losses/immonium/isotopes (default)")
+    p.add_argument("--collision-energy", type=float, default=25.0,
+                   help="normalized collision energy for the realistic model")
     p.add_argument("--variants", type=int, default=0,
                    help="noisy variants per spectrum (0 = ideal spectra)")
     p.add_argument("--out", required=True)
@@ -346,6 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="output mzML path")
     common(p)
     _add_noise_options(p)
+    _add_realism_options(p)
     p.set_defaults(func=cmd_generate_lcms_run)
 
     p = sub.add_parser("merge", help="combine spectral files into one library")

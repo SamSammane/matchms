@@ -158,3 +158,40 @@ def isotope_envelope_mz(formula: str, adduct: str = "[M+H]+", prune: float = 1e-
     z = abs(charge)
     return [((mass + delta) / z, abundance)
             for mass, abundance in isotope_pattern(formula, prune=prune, max_peaks=max_peaks)]
+
+
+# Senko's averagine: average elemental composition of peptides per
+# 111.1254 Da of monoisotopic mass, used to model isotope envelopes when
+# only a mass (not a formula) is known.
+_AVERAGINE = {"C": 4.9384, "H": 7.7583, "N": 1.3577, "O": 1.4773, "S": 0.0417}
+_AVERAGINE_UNIT = 111.1254
+
+
+def averagine_formula(mass: float) -> Dict[str, int]:
+    """Estimate an elemental composition for a peptide-like neutral mass."""
+    if mass <= 0:
+        raise ValueError("mass must be positive")
+    scale = mass / _AVERAGINE_UNIT
+    counts = {el: max(0, round(n * scale)) for el, n in _AVERAGINE.items()}
+    counts = {el: n for el, n in counts.items() if n > 0}
+    # top up hydrogens so the model mass tracks the requested mass
+    model_mass = sum(MONOISOTOPIC[el] * n for el, n in counts.items())
+    counts["H"] = counts.get("H", 0) + max(0, round((mass - model_mass) / MONOISOTOPIC["H"]))
+    return counts
+
+
+def averagine_envelope_mz(neutral_mass: float, charge: int = 1, prune: float = 1e-3,
+                          max_peaks: int = 8) -> List[Tuple[float, float]]:
+    """Approximate isotope envelope (m/z, rel abundance) for a neutral mass
+    observed at the given positive charge, via the averagine model."""
+    if charge < 1:
+        raise ValueError("charge must be >= 1")
+    counts = averagine_formula(neutral_mass)
+    formula = "".join(f"{el}{n}" for el, n in sorted(counts.items()))
+    pattern = isotope_pattern(formula, prune=prune, max_peaks=max_peaks)
+    if not pattern:
+        return [((neutral_mass + charge * PROTON) / charge, 1.0)]
+    # anchor the monoisotopic peak on the requested mass; keep isotope spacings
+    mono = pattern[0][0]
+    return [((neutral_mass + (mass - mono) + charge * PROTON) / charge, abundance)
+            for mass, abundance in pattern]

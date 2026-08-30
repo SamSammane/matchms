@@ -33,6 +33,17 @@ readable by pyteomics, OpenMS, ProteoWizard):
 simms generate lcms-run -i sim_library.mgf --gradient 600 --out run.mzML --seed 1 --json
 ```
 
+Realism defaults to the `default` preset (EMG tailing, isotope/charge
+envelopes, contaminants, chemical noise, spray flicker, calibration drift,
+saturation, chimeric MS2, dynamic exclusion). Use `--realism none` for
+idealized textbook output, `--realism high` for a stress-test instrument,
+and the per-knob overrides listed in `simms generate lcms-run --help` to
+isolate a single effect. Peptide MS2 spectra use the mobile-proton
+intensity model by default; `--fragment-model simple` gives the plain b/y
+ladder. The JSON result reports `precursor_species` (charge-envelope
+expansion) and `chimeric_ms2_scans` so agents can assert on realism
+behavior without parsing the mzML.
+
 Combine heterogeneous libraries: `simms merge -i a.mgf b.msp c.json -o all.mgf --json`.
 
 Multi-step dataset builds belong in a YAML pipeline (`simms pipeline run f.yaml`)
