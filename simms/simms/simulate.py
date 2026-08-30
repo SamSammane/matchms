@@ -27,8 +27,9 @@ from matchms import Spectrum
 from . import chem, peptides
 from .noise import NoiseModel
 from .realism import (REALISM_PRESETS, RealismConfig, SprayStability,
-                      apply_saturation, calibration_drift_ppm, chemical_noise,
-                      emg_profile, CONTAMINANT_IONS)
+                      apply_saturation, calibration_drift_ppm,
+                      centroids_to_profile, chemical_noise, emg_profile,
+                      CONTAMINANT_IONS)
 
 
 def theoretical_peptide_spectrum(sequence: str, charge: int = 2,
@@ -41,17 +42,29 @@ def theoretical_peptide_spectrum(sequence: str, charge: int = 2,
     model="simple": clean b/y ladder with a positional intensity heuristic.
     model="realistic": mobile-proton intensity model with isotope peaks,
     neutral losses, immonium ions and collision-energy dependence.
+    model="prosit": deep-learning predicted intensities from the Prosit
+    model served by Koina (network required; results cached locally).
     """
     if model == "realistic":
         ions = peptides.realistic_fragment_ions(
             sequence, precursor_charge=charge, collision_energy=collision_energy)
+        mz = np.array([ion.mz for ion in ions])
+        intensities = np.array([ion.intensity for ion in ions])
+        annotations = [ion.ion_type for ion in ions]
     elif model == "simple":
         ions = peptides.fragment_ions(sequence, ion_types=ion_types,
                                       max_fragment_charge=max_fragment_charge)
+        mz = np.array([ion.mz for ion in ions])
+        intensities = np.array([ion.intensity for ion in ions])
+        annotations = [ion.ion_type for ion in ions]
+    elif model == "prosit":
+        from . import mlfrag
+        prediction = mlfrag.predict([sequence], [charge], [collision_energy])[0]
+        mz = np.array(prediction.mz)
+        intensities = np.array(prediction.intensities) * 100.0
+        annotations = prediction.annotations
     else:
-        raise ValueError(f"unknown fragment model {model!r}; use simple|realistic")
-    mz = np.array([ion.mz for ion in ions])
-    intensities = np.array([ion.intensity for ion in ions])
+        raise ValueError(f"unknown fragment model {model!r}; use simple|realistic|prosit")
     order = np.argsort(mz)
     metadata = {
         "compound_name": sequence,
@@ -64,7 +77,7 @@ def theoretical_peptide_spectrum(sequence: str, charge: int = 2,
         "simulated": f"theoretical-peptide-{model}",
         "fragment_model": model,
         "collision_energy": collision_energy,
-        "ion_annotations": ",".join(ions[i].ion_type for i in order),
+        "ion_annotations": ",".join(annotations[i] for i in order),
     }
     return Spectrum(mz=mz[order], intensities=intensities[order],
                     metadata=metadata, metadata_harmonization=False)
@@ -241,20 +254,37 @@ def simulate_lcms_run(spectra: Sequence[Spectrum], output_path: str,
                       ms2_trigger_fraction: float = 0.05,
                       noise: Optional[NoiseModel] = None,
                       realism: Optional[RealismConfig] = None,
+                      acquisition: str = "dda",
+                      dia_range: Tuple[float, float] = (400.0, 1000.0),
+                      dia_window: float = 25.0,
+                      dia_overlap: float = 1.0,
                       seed: int = 0) -> Dict[str, object]:
-    """Simulate a DDA LC-MS/MS run from a list of (fragment) spectra.
+    """Simulate an LC-MS/MS run from a list of (fragment) spectra.
 
     Each input spectrum becomes one eluting compound (EMG elution profile,
     one or more charge states, isotope envelopes). MS1 scans are emitted
-    every ``ms1_interval_seconds``; the ``dda_top_n`` most intense precursor
-    species above threshold trigger MS2 scans (with co-isolation chimeras
-    and dynamic exclusion). The run is written to ``output_path`` as
-    indexed mzML.
+    every ``ms1_interval_seconds``.
+
+    acquisition="dda": the ``dda_top_n`` most intense precursor species
+    above threshold trigger MS2 scans (with co-isolation chimeras and
+    dynamic exclusion).
+
+    acquisition="dia": every MS1 is followed by a full cycle of fixed-width
+    isolation windows covering ``dia_range``; each window's MS2 multiplexes
+    the fragments of every precursor species currently eluting inside it
+    (SWATH-style), with ``dia_overlap`` m/z of window overlap.
+
+    With ``realism.profile_mode`` the written spectra are profile-mode
+    (resolution-dependent gaussian peak shapes) instead of centroids.
+    The run is written to ``output_path`` as indexed mzML.
     """
     from psims.mzml import MzMLWriter  # deferred: import cost & optional at runtime
 
     if realism is None:
         realism = REALISM_PRESETS["default"]
+    if acquisition not in ("dda", "dia"):
+        raise ValueError(f"unknown acquisition scheme {acquisition!r}; use dda|dia")
+    dia_edges = np.arange(dia_range[0], dia_range[1], dia_window) if acquisition == "dia" else np.array([])
 
     rng = np.random.default_rng(seed)
     compounds = [c for c in (_compound_from_spectrum(i, s, rng, gradient_seconds,
@@ -281,7 +311,7 @@ def simulate_lcms_run(spectra: Sequence[Spectrum], output_path: str,
 
     scans: List[Dict[str, object]] = []
     scan_id = 0
-    ms1_count = ms2_count = chimera_count = 0
+    ms1_count = ms2_count = chimera_count = multiplexed_count = 0
     last_triggered: Dict[Tuple[int, int], float] = {}
 
     for scan_index, t in enumerate(times):
@@ -321,60 +351,109 @@ def simulate_lcms_run(spectra: Sequence[Spectrum], output_path: str,
         scans.append({"id": ms1_id, "ms_level": 1, "time": t,
                       "mz": mz_arr[order], "intensities": int_arr[order]})
 
-        # --- data-dependent MS2 on the top-N species of this MS1 scan
-        eligible = []
-        for s, level in zip(all_species, species_level):
-            compound = compounds[s.compound_index]
-            if level < ms2_trigger_fraction * compound.abundance * s.weight:
-                continue
-            key = (s.compound_index, s.charge)
-            if t - last_triggered.get(key, -1e12) < realism.dynamic_exclusion_seconds:
-                continue
-            eligible.append((s, level))
-        eligible.sort(key=lambda pair: pair[1], reverse=True)
+        if acquisition == "dda":
+            # --- data-dependent MS2 on the top-N species of this MS1 scan
+            eligible = []
+            for s, level in zip(all_species, species_level):
+                compound = compounds[s.compound_index]
+                if level < ms2_trigger_fraction * compound.abundance * s.weight:
+                    continue
+                key = (s.compound_index, s.charge)
+                if t - last_triggered.get(key, -1e12) < realism.dynamic_exclusion_seconds:
+                    continue
+                eligible.append((s, level))
+            eligible.sort(key=lambda pair: pair[1], reverse=True)
 
-        for s, level in eligible[:dda_top_n]:
-            compound = compounds[s.compound_index]
-            scale = level / (compound.abundance * s.weight)
-            frag_mz = compound.ms2_mz.copy()
-            frag_int = compound.ms2_intensities * level
-            is_chimera = False
-            if realism.chimeras:
-                half_window = realism.isolation_window / 2.0
-                for other, other_level in zip(all_species, species_level):
-                    # co-isolation matters only when comparable to the target
-                    if other is s or other_level < max(1.0, 0.02 * level):
+            half_window = realism.isolation_window / 2.0
+            for s, level in eligible[:dda_top_n]:
+                compound = compounds[s.compound_index]
+                frag_mz = compound.ms2_mz.copy()
+                frag_int = compound.ms2_intensities * level
+                is_chimera = False
+                if realism.chimeras:
+                    for other, other_level in zip(all_species, species_level):
+                        # co-isolation matters only when comparable to the target
+                        if other is s or other_level < max(1.0, 0.02 * level):
+                            continue
+                        if abs(other.mz - s.mz) <= half_window:
+                            other_compound = compounds[other.compound_index]
+                            frag_mz = np.concatenate([frag_mz, other_compound.ms2_mz])
+                            frag_int = np.concatenate([
+                                frag_int, other_compound.ms2_intensities * other_level])
+                            is_chimera = True
+                if is_chimera:
+                    chimera_count += 1
+                frag_mz = _apply_drift(frag_mz, drift)
+                if noise is not None and frag_mz.size:
+                    frag_mz, frag_int = noise.apply(frag_mz, frag_int, rng)
+                frag_int = apply_saturation(frag_int, realism.saturation)
+                if frag_mz.size == 0:
+                    continue
+                order = np.argsort(frag_mz)
+                scan_id += 1
+                ms2_count += 1
+                scans.append({
+                    "id": f"scan={scan_id}", "ms_level": 2,
+                    "time": t + ms1_interval_seconds * 0.3,
+                    "mz": frag_mz[order], "intensities": frag_int[order],
+                    "precursor": {"mz": s.mz, "charge": s.charge,
+                                  "intensity": level, "parent_id": ms1_id,
+                                  "isolation": (half_window, s.mz, half_window)},
+                })
+                last_triggered[(s.compound_index, s.charge)] = t
+        else:
+            # --- DIA: one MS2 per isolation window, every cycle (SWATH-style)
+            for window_index, window_low in enumerate(dia_edges):
+                low = window_low - dia_overlap / 2.0
+                high = window_low + dia_window + dia_overlap / 2.0
+                center = window_low + dia_window / 2.0
+                frag_parts_mz: List[np.ndarray] = []
+                frag_parts_int: List[np.ndarray] = []
+                contributors = 0
+                total_level = 0.0
+                for s, level in zip(all_species, species_level):
+                    if level < 1.0 or not low <= s.mz <= high:
                         continue
-                    if abs(other.mz - s.mz) <= half_window:
-                        other_compound = compounds[other.compound_index]
-                        frag_mz = np.concatenate([frag_mz, other_compound.ms2_mz])
-                        frag_int = np.concatenate([
-                            frag_int, other_compound.ms2_intensities * other_level])
-                        is_chimera = True
-            if is_chimera:
-                chimera_count += 1
-            frag_mz = _apply_drift(frag_mz, drift)
-            if noise is not None and frag_mz.size:
-                frag_mz, frag_int = noise.apply(frag_mz, frag_int, rng)
-            frag_int = apply_saturation(frag_int, realism.saturation)
-            if frag_mz.size == 0:
-                continue
-            order = np.argsort(frag_mz)
-            scan_id += 1
-            ms2_count += 1
-            scans.append({
-                "id": f"scan={scan_id}", "ms_level": 2,
-                "time": t + ms1_interval_seconds * 0.3,
-                "mz": frag_mz[order], "intensities": frag_int[order],
-                "precursor": {"mz": s.mz, "charge": s.charge,
-                              "intensity": level, "parent_id": ms1_id},
-            })
-            last_triggered[(s.compound_index, s.charge)] = t
+                    compound = compounds[s.compound_index]
+                    frag_parts_mz.append(compound.ms2_mz)
+                    frag_parts_int.append(compound.ms2_intensities * level)
+                    contributors += 1
+                    total_level += level
+                if contributors >= 2:
+                    multiplexed_count += 1
+                frag_mz = (np.concatenate(frag_parts_mz) if frag_parts_mz
+                           else np.array([]))
+                frag_int = (np.concatenate(frag_parts_int) if frag_parts_int
+                            else np.array([]))
+                # DIA MS2 carries its own chemical background
+                noise_mz2, noise_int2 = chemical_noise(
+                    rng, realism.chemical_noise_peaks // 5,
+                    realism.chemical_noise_level * max_abundance, (mz_lo, mz_hi))
+                frag_mz = np.concatenate([frag_mz, noise_mz2])
+                frag_int = np.concatenate([frag_int, noise_int2])
+                frag_mz = _apply_drift(frag_mz, drift)
+                if noise is not None and frag_mz.size:
+                    frag_mz, frag_int = noise.apply(frag_mz, frag_int, rng)
+                frag_int = apply_saturation(frag_int, realism.saturation)
+                order = np.argsort(frag_mz)
+                scan_id += 1
+                ms2_count += 1
+                scans.append({
+                    "id": f"scan={scan_id}", "ms_level": 2,
+                    "time": t + (window_index + 1) / (len(dia_edges) + 1) * ms1_interval_seconds,
+                    "mz": frag_mz[order], "intensities": frag_int[order],
+                    "precursor": {"mz": center, "charge": None,
+                                  "intensity": total_level, "parent_id": ms1_id,
+                                  "isolation": (dia_window / 2.0 + dia_overlap / 2.0,
+                                                center,
+                                                dia_window / 2.0 + dia_overlap / 2.0)},
+                })
 
     with MzMLWriter(open(output_path, "wb"), close=True) as writer:
         writer.controlled_vocabularies()
         writer.file_description(["MS1 spectrum", "MSn spectrum", "centroid spectrum"])
-        writer.software_list([{"id": "simms", "version": "0.1.0",
+        from . import __version__ as _simms_version
+        writer.software_list([{"id": "simms", "version": _simms_version,
                                "params": ["custom unreleased software tool"]}])
         instrument = writer.InstrumentConfiguration(
             id="IC1", component_list=writer.ComponentList([
@@ -391,34 +470,49 @@ def simulate_lcms_run(spectra: Sequence[Spectrum], output_path: str,
         with writer.run(id="simulated_run", instrument_configuration="IC1"):
             with writer.spectrum_list(count=len(scans)):
                 for scan in scans:
+                    mz_out, int_out = scan["mz"], scan["intensities"]
+                    if realism.profile_mode:
+                        mz_out, int_out = centroids_to_profile(
+                            mz_out, int_out, realism.resolving_power)
                     params = [
                         {"ms level": scan["ms_level"]},
-                        "centroid spectrum",
                         "MS1 spectrum" if scan["ms_level"] == 1 else "MSn spectrum",
                     ]
                     precursor_information = None
                     if scan["ms_level"] == 2:
                         prec = scan["precursor"]
+                        lower, target, upper = prec["isolation"]
                         precursor_information = {
                             "mz": prec["mz"], "intensity": prec["intensity"],
                             "charge": prec["charge"], "scan_id": prec["parent_id"],
                             "activation": ["HCD", {"collision energy": 25.0}],
+                            "isolation_window_args": {"lower": lower,
+                                                      "target": target,
+                                                      "upper": upper},
                         }
                     writer.write_spectrum(
-                        scan["mz"], scan["intensities"],
+                        mz_out, int_out,
                         id=scan["id"], params=params,
+                        centroided=not realism.profile_mode,
                         scan_start_time=scan["time"] / 60.0,
                         precursor_information=precursor_information,
                     )
 
-    return {
+    result = {
         "output": output_path,
+        "acquisition": acquisition,
         "compounds": len(compounds),
         "precursor_species": len(all_species),
         "ms1_scans": ms1_count,
         "ms2_scans": ms2_count,
-        "chimeric_ms2_scans": chimera_count,
         "total_scans": len(scans),
+        "profile_mode": realism.profile_mode,
         "gradient_seconds": gradient_seconds,
         "seed": seed,
     }
+    if acquisition == "dda":
+        result["chimeric_ms2_scans"] = chimera_count
+    else:
+        result["dia_windows_per_cycle"] = len(dia_edges)
+        result["multiplexed_ms2_scans"] = multiplexed_count
+    return result

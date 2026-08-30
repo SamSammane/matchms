@@ -1,5 +1,10 @@
 # simms — simulated mass spectrometry test data from the CLI
 
+> Full documentation: [docs/APPROACH.md](docs/APPROACH.md) (scientific
+> models), [docs/CLI.md](docs/CLI.md) (complete command reference),
+> [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) (architecture & contributing),
+> [AGENTS.md](AGENTS.md) (driving simms from coding agents).
+
 `simms` is a single command-line tool that generates, mutates, combines and
 validates simulated mass spectrometry data. It unifies the capabilities of
 four ecosystems:
@@ -43,6 +48,15 @@ simms generate from-massbank --massbank /path/to/MassBank-data \
 # Simulate a full DDA LC-MS/MS run (MS1 isotope envelopes + top-N MS2) as mzML
 simms generate lcms-run -i simulated.mgf --gradient 600 --peak-fwhm 10 \
     --ms1-interval 1 --top-n 3 --noise-preset clean-orbitrap --out run.mzML
+
+# SWATH-style DIA instead of DDA, with profile-mode peaks at 60k resolution
+simms generate lcms-run -i simulated.mgf --acquisition dia \
+    --dia-range 400 1200 --dia-window 20 --profile --resolving-power 60000 \
+    --out dia_run.mzML
+
+# ML-predicted fragment intensities (Prosit via the Koina service, cached)
+simms generate peptides --fasta proteome.fasta --fragment-model prosit \
+    --collision-energy 28 --out prosit_library.mgf
 ```
 
 Noise presets: `none`, `clean-orbitrap`, `default`, `noisy-qtof`, `harsh` —
@@ -73,6 +87,9 @@ controlled by `--realism none|default|high` plus per-knob overrides:
 | Detector saturation (soft knee, hard clip) | `--saturation` |
 | DDA dynamic exclusion | `--exclusion` |
 | Co-isolation chimeric MS2 spectra | `--isolation-window`, `--no-chimeras` |
+| Profile-mode peak shapes (resolution-scaled FWHM) | `--profile`, `--resolving-power` |
+| DIA acquisition (SWATH windows, multiplexed MS2) | `--acquisition dia`, `--dia-range`, `--dia-window`, `--dia-overlap` |
+| Prosit ML fragment intensities (Koina, cached) | `--fragment-model prosit` |
 
 ## Combining and converting
 

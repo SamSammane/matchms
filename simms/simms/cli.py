@@ -14,6 +14,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
+from .mlfrag import KoinaUnavailable
 from .noise import NOISE_PRESETS, NoiseModel
 
 
@@ -69,6 +70,12 @@ def _add_realism_options(parser: argparse.ArgumentParser) -> None:
                        help="disable background contaminant ions")
     group.add_argument("--no-chimeras", action="store_true",
                        help="disable co-isolation chimeric MS2 spectra")
+    group.add_argument("--profile", action="store_true",
+                       help="write profile-mode spectra (gaussian peak shapes) "
+                            "instead of centroids")
+    group.add_argument("--resolving-power", type=float,
+                       help="resolving power at m/z 200 for profile mode "
+                            "(Orbitrap-like 1/sqrt(mz) scaling; default 30000)")
 
 
 def _realism_from_args(args: argparse.Namespace):
@@ -96,6 +103,11 @@ def _realism_from_args(args: argparse.Namespace):
         overrides["contaminants"] = False
     if args.no_chimeras:
         overrides["chimeras"] = False
+    if getattr(args, "profile", False):
+        overrides["profile_mode"] = True
+    if getattr(args, "resolving_power", None) is not None:
+        overrides["resolving_power"] = args.resolving_power
+        overrides["profile_mode"] = True
     return replace(config, **overrides)
 
 
@@ -156,9 +168,14 @@ def cmd_describe(args: argparse.Namespace) -> int:
             "sinusoidal mass calibration drift",
             "detector saturation (soft knee + hard clip)",
             "DDA dynamic exclusion and co-isolation chimeric MS2",
+            "SWATH-style DIA acquisition with multiplexed isolation windows",
+            "profile-mode peak shapes with resolution-dependent widths",
             "mobile-proton MS2 intensity model with neutral losses, "
             "immonium ions, fragment isotopes and collision-energy dependence",
+            "Prosit ML-predicted fragment intensities via Koina (cached)",
         ],
+        "acquisition_schemes": ["dda", "dia"],
+        "fragment_models": ["simple", "realistic", "prosit"],
         "openms_tools_available": sorted(openms_backend.discover()),
     }
     print(json.dumps(manifest, indent=2))
@@ -253,6 +270,9 @@ def cmd_generate_lcms_run(args: argparse.Namespace) -> int:
         spectra, args.out, gradient_seconds=args.gradient,
         peak_fwhm_seconds=args.peak_fwhm, ms1_interval_seconds=args.ms1_interval,
         dda_top_n=args.top_n, noise=noise, realism=_realism_from_args(args),
+        acquisition=args.acquisition,
+        dia_range=(args.dia_range[0], args.dia_range[1]),
+        dia_window=args.dia_window, dia_overlap=args.dia_overlap,
         seed=args.seed)
     result["command"] = "generate lcms-run"
     result["realism"] = args.realism
@@ -378,10 +398,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ion-types", default="by",
                    help="fragment ion series for the simple model, e.g. by, aby")
     p.add_argument("--max-fragment-charge", type=int, default=1)
-    p.add_argument("--fragment-model", choices=["simple", "realistic"],
+    p.add_argument("--fragment-model", choices=["simple", "realistic", "prosit"],
                    default="realistic",
-                   help="intensity model: simple b/y ladder, or mobile-proton "
-                        "realistic model with losses/immonium/isotopes (default)")
+                   help="intensity model: simple b/y ladder; mobile-proton "
+                        "realistic model with losses/immonium/isotopes (default); "
+                        "or prosit, ML-predicted intensities from the Koina "
+                        "service (network required, responses cached)")
     p.add_argument("--collision-energy", type=float, default=25.0,
                    help="normalized collision energy for the realistic model")
     p.add_argument("--variants", type=int, default=0,
@@ -426,6 +448,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--peak-fwhm", type=float, default=10.0, help="chromatographic FWHM in seconds")
     p.add_argument("--ms1-interval", type=float, default=1.0, help="MS1 scan interval in seconds")
     p.add_argument("--top-n", type=int, default=3, help="DDA precursors per MS1 scan")
+    p.add_argument("--acquisition", choices=["dda", "dia"], default="dda",
+                   help="acquisition scheme: data-dependent top-N, or "
+                        "SWATH-style data-independent windows")
+    p.add_argument("--dia-range", nargs=2, type=float, default=[400.0, 1000.0],
+                   metavar=("LOW", "HIGH"),
+                   help="precursor m/z range covered by DIA windows")
+    p.add_argument("--dia-window", type=float, default=25.0,
+                   help="DIA isolation window width in m/z")
+    p.add_argument("--dia-overlap", type=float, default=1.0,
+                   help="overlap between adjacent DIA windows in m/z")
     p.add_argument("--out", required=True, help="output mzML path")
     common(p)
     _add_noise_options(p)
@@ -498,7 +530,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return args.func(args)
     except BrokenPipeError:
         return 0  # stdout closed early (e.g. piped through head)
-    except (FileNotFoundError, ValueError) as err:
+    except (FileNotFoundError, ValueError, KoinaUnavailable) as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
 

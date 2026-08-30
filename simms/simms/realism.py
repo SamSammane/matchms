@@ -56,6 +56,8 @@ class RealismConfig:
     isolation_window: float = 1.6
     chimeras: bool = True
     dynamic_exclusion_seconds: float = 20.0
+    profile_mode: bool = False
+    resolving_power: float = 30000.0  # at m/z 200, Orbitrap-like 1/sqrt(mz) scaling
 
 
 REALISM_PRESETS: Dict[str, RealismConfig] = {
@@ -142,6 +144,58 @@ def chemical_noise(rng: np.random.Generator, n_peaks: int, level: float,
     mz = rng.uniform(mz_range[0], mz_range[1], size=n_peaks)
     intensities = rng.exponential(level, size=n_peaks)
     return mz, intensities
+
+
+def peak_sigma_mz(mz: np.ndarray, resolving_power: float) -> np.ndarray:
+    """Gaussian sigma of a profile peak at each m/z.
+
+    Resolving power is specified at m/z 200 and scales as 1/sqrt(m/z)
+    (Orbitrap-like): R(mz) = R200 * sqrt(200 / mz); FWHM = mz / R(mz).
+    """
+    mz = np.asarray(mz, dtype=float)
+    r_at_mz = resolving_power * np.sqrt(200.0 / np.maximum(mz, 1.0))
+    return (mz / r_at_mz) / 2.3548200450309493
+
+
+def centroids_to_profile(mz: np.ndarray, intensities: np.ndarray,
+                         resolving_power: float,
+                         points_per_fwhm: int = 6,
+                         span_fwhms: float = 2.5,
+                         max_points: int = 400000) -> Tuple[np.ndarray, np.ndarray]:
+    """Render centroided peaks as profile-mode data.
+
+    Each centroid becomes a gaussian sampled on a local grid; overlapping
+    peaks sum, so unresolved doublets merge exactly as a real detector
+    records them. Returns (mz, intensity) sorted by m/z.
+    """
+    mz = np.asarray(mz, dtype=float)
+    intensities = np.asarray(intensities, dtype=float)
+    if mz.size == 0:
+        return mz, intensities
+    order = np.argsort(mz)
+    mz, intensities = mz[order], intensities[order]
+    sigmas = peak_sigma_mz(mz, resolving_power)
+
+    # union grid of all local sample positions
+    offsets = np.linspace(-span_fwhms, span_fwhms,
+                          int(2 * span_fwhms * points_per_fwhm) + 1)
+    grid = (mz[:, None] + offsets[None, :] * sigmas[:, None] * 2.3548).ravel()
+    grid = np.unique(np.round(grid, 6))
+    if grid.size > max_points:
+        step = int(np.ceil(grid.size / max_points))
+        grid = grid[::step]
+
+    profile = np.zeros_like(grid)
+    # evaluate each peak only on its own neighborhood (searchsorted windows)
+    half_span = span_fwhms * 2.3548 * sigmas
+    starts = np.searchsorted(grid, mz - half_span)
+    stops = np.searchsorted(grid, mz + half_span)
+    for center, sigma, height, start, stop in zip(mz, sigmas, intensities, starts, stops):
+        if stop <= start:
+            continue
+        window = grid[start:stop]
+        profile[start:stop] += height * np.exp(-0.5 * ((window - center) / sigma) ** 2)
+    return grid, profile
 
 
 def apply_saturation(intensities: np.ndarray, saturation: Optional[float]) -> np.ndarray:
